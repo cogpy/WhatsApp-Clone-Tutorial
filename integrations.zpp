@@ -1,0 +1,690 @@
+/*******************************************************************************
+ * WhatsApp Clone - External Integration Contracts Formal Specification (Z++)
+ * 
+ * This specification formalizes the contracts for external service integrations
+ * and event-driven components, including:
+ * - Unsplash API integration for random photos
+ * - GraphQL subscription event handling
+ * - PostgreSQL LISTEN/NOTIFY for PubSub
+ * - External REST API data sources
+ ******************************************************************************/
+
+include "data_model.zpp"
+include "system_state.zpp"
+include "operations.zpp"
+
+
+/*******************************************************************************
+ * SECTION 1: UNSPLASH API INTEGRATION
+ ******************************************************************************/
+
+/*
+ * Unsplash Photo Response
+ * 
+ * Represents the structure of a photo returned by Unsplash API.
+ * The full API response contains many more fields, but we only
+ * model the fields used by the application.
+ */
+schema UnsplashPhoto
+  id: seq char
+  urls: seq char ⇸ URL
+  alt_description: seq char
+  width: ℕ
+  height: ℕ
+where
+  #id > 0 ∧
+  "regular" ∈ dom urls ∧  // Regular size URL
+  "small" ∈ dom urls ∧     // Small size URL
+  "thumb" ∈ dom urls       // Thumbnail URL
+
+
+/*
+ * Unsplash API Request
+ * 
+ * Represents a request to the Unsplash API.
+ */
+schema UnsplashAPIRequest
+  endpoint: seq char
+  method: seq char
+  headers: seq char ⇸ seq char
+  queryParams: seq char ⇸ seq char
+where
+  method ∈ {"GET", "POST", "PUT", "DELETE"} ∧
+  "Authorization" ∈ dom headers
+
+
+/*
+ * Unsplash API Response
+ * 
+ * Generic response structure from Unsplash API.
+ */
+schema UnsplashAPIResponse
+  statusCode: ℕ
+  headers: seq char ⇸ seq char
+  body: seq char
+  success: 𝔹
+where
+  statusCode ≥ 100 ∧ statusCode < 600 ∧
+  (statusCode ≥ 200 ∧ statusCode < 300 ⇔ success = true)
+
+
+/*
+ * Operation: Get Random Photo from Unsplash
+ * 
+ * Fetches a random photo URL from Unsplash API.
+ * Used to provide default chat pictures.
+ * 
+ * Corresponds to: UnsplashApi.getRandomPhoto()
+ * Endpoint: GET https://api.unsplash.com/photos/random
+ */
+schema GetRandomPhoto
+  ΞApplicationState
+  ExternalAPIState
+  photo!: UnsplashPhoto ∪ {null}
+  photoURL!: URL ∪ {null}
+  success!: 𝔹
+where
+  /* Build API request */
+  let request == UnsplashAPIRequest' |
+    request.endpoint = "/photos/random" ∧
+    request.method = "GET" ∧
+    request.headers = {"Authorization" ↦ 
+      ("Client-ID " ⌢ externalAPIs.unsplashConfig.accessKey)} ∧
+    request.queryParams = {
+      "query" ↦ "people",
+      "orientation" ↦ "portrait"
+    } •
+    /* Check cache first */
+    let cacheKey == externalAPIs.unsplashConfig.baseURL ⌢ 
+                    request.endpoint ⌢ "?query=people&orientation=portrait" •
+      (cacheKey ∈ dom externalAPIs.unsplashCache.urlCache ⇒
+        /* Cache hit */
+        let (cachedResponse, timestamp) == 
+          externalAPIs.unsplashCache.urlCache(cacheKey) •
+          (/* Check if cache is still valid */
+           /* current_time - timestamp < cacheTTL */ ⇒
+             (/* Parse cached response */
+              photo! = /* deserialize(cachedResponse) */ ∧
+              photoURL! = photo!.urls("regular") ∧
+              success! = true)
+           ⊕
+             /* Cache expired - fetch fresh data */
+             /* Make HTTP request (detailed below) */
+             true
+          )
+      )
+      ⊕
+        /* Cache miss - make HTTP request */
+        let response == /* HTTP GET request */ •
+          (response.success = true ⇒
+            (/* Parse JSON response */
+             photo! = /* JSON.parse(response.body) */ ∧
+             photoURL! = photo!.urls("regular") ∧
+             success! = true ∧
+             /* Update cache */
+             externalAPIs'.unsplashCache.urlCache = 
+               externalAPIs.unsplashCache.urlCache ⊕ 
+               {cacheKey ↦ (response.body, /* current_time */)}
+            )
+          ⊕
+            /* Request failed */
+            (photo! = null ∧
+             photoURL! = null ∧
+             success! = false)
+          )
+
+
+/*
+ * Unsplash API Rate Limiting
+ * 
+ * Unsplash API has rate limits that must be respected.
+ */
+schema UnsplashRateLimits
+  requestsPerHour: ℕ
+  remainingRequests: ℕ
+  resetTime: DateTime
+where
+  requestsPerHour = 50 ∧  // Demo/Development tier
+  remainingRequests ≤ requestsPerHour
+
+
+/*
+ * Operation: Handle Rate Limit Exceeded
+ * 
+ * Handles the case when Unsplash API rate limit is exceeded.
+ * Falls back to default/cached photo URLs.
+ */
+schema HandleRateLimitExceeded
+  ΞApplicationState
+  fallbackURL!: URL
+where
+  /* Use a default fallback URL when rate limited */
+  fallbackURL! = "https://randomuser.me/api/portraits/thumb/lego/1.jpg"
+
+
+/*******************************************************************************
+ * SECTION 2: POSTGRESQL PUBSUB INTEGRATION
+ ******************************************************************************/
+
+/*
+ * PostgreSQL NOTIFY Payload
+ * 
+ * Payload sent with PostgreSQL NOTIFY command.
+ * Contains serialized event data.
+ */
+schema PostgresNotifyPayload
+  channel: seq char
+  payload: seq char
+  timestamp: DateTime
+where
+  channel ∈ {"messageAdded", "chatAdded", "chatRemoved"} ∧
+  #payload > 0
+
+
+/*
+ * Operation: Publish Event to PostgreSQL
+ * 
+ * Publishes an event using PostgreSQL NOTIFY.
+ * This ensures events are distributed across all server instances.
+ * 
+ * Corresponds to: PubSub.publish(triggerName, payload)
+ */
+schema PublishToPostgres
+  ΔApplicationState
+  PubSubState
+  ConnectionPoolState
+  eventType?: EventType
+  payload?: MessageID ∪ ChatID
+  success!: 𝔹
+where
+  /* Map event type to PostgreSQL channel */
+  let channel == 
+    (eventType? = messageAdded ⇒ "messageAdded")
+    ⊕ (eventType? = chatAdded ⇒ "chatAdded")
+    ⊕ (eventType? = chatRemoved ⇒ "chatRemoved") •
+    /* Serialize payload */
+    let serializedPayload == /* JSON.stringify(payload?) */ •
+      /* Execute PostgreSQL NOTIFY */
+      /* SQL: NOTIFY channel, serializedPayload */
+      success! = true ∧
+      /* Event added to queue for processing */
+      pubsubState'.eventQueue = pubsubState.eventQueue ⌢ 
+        ⟨PubSubEvent' | 
+          eventType = eventType? ∧ 
+          payload = payload? ∧ 
+          timestamp = /* current time */⟩
+
+
+/*
+ * Operation: Listen for PostgreSQL Notifications
+ * 
+ * Registers a listener for PostgreSQL NOTIFY events.
+ * Called during subscription setup.
+ * 
+ * Corresponds to: PostgresPubSub.asyncIterator(triggers)
+ */
+schema ListenPostgresNotifications
+  ΔApplicationState
+  PubSubState
+  ConnectionPoolState
+  channels?: seq (seq char)
+  success!: 𝔹
+where
+  /* For each channel, execute LISTEN */
+  ∀ channel: seq char • channel ∈ ran channels? ⇒
+    (/* SQL: LISTEN channel */
+     pubsubState'.postgresChannel = 
+       pubsubState.postgresChannel ⊕ 
+       {channel ↦ /* map to EventType */} ∧
+     success! = true
+    )
+
+
+/*
+ * Operation: Receive PostgreSQL Notification
+ * 
+ * Receives and processes a PostgreSQL NOTIFY event.
+ * Distributes the event to relevant subscribers.
+ */
+schema ReceivePostgresNotification
+  ΔApplicationState
+  PubSubState
+  ActiveSessions
+  notification?: PostgresNotifyPayload
+  notifiedSubscriptions!: seq (seq char)
+where
+  /* Parse notification payload */
+  let event == /* deserialize notification */ •
+    /* Find all subscriptions for this event type */
+    let relevantSubs == 
+      {sid ↦ sub | sid: seq char; sub: ActiveSubscription •
+        sid ∈ dom pubsubState.subscriptions ∧
+        sub = pubsubState.subscriptions(sid) ∧
+        sub.eventType = event.eventType} •
+      /* Filter subscriptions based on filter function */
+      notifiedSubscriptions! = 
+        ⟨sid | sid: seq char; sub: ActiveSubscription •
+          sid ∈ dom relevantSubs ∧
+          sub = relevantSubs(sid) ∧
+          let session == activeSessions.sessions(sub.sessionId) •
+            sub.filter(event, session)⟩
+
+
+/*******************************************************************************
+ * SECTION 3: GRAPHQL SUBSCRIPTION EVENT HANDLING
+ ******************************************************************************/
+
+/*
+ * WebSocket Connection
+ * 
+ * Represents a WebSocket connection for GraphQL subscriptions.
+ */
+schema WebSocketConnection
+  connectionId: seq char
+  sessionId: seq char
+  protocol: seq char
+  state: seq char
+  lastPing: DateTime
+where
+  #connectionId > 0 ∧
+  protocol ∈ {"graphql-ws", "graphql-transport-ws"} ∧
+  state ∈ {"connecting", "connected", "closing", "closed"}
+
+
+/*
+ * Active WebSocket Connections
+ * 
+ * Collection of all active WebSocket connections.
+ */
+schema WebSocketConnections
+  connections: seq char ⇸ WebSocketConnection
+where
+  ∀ cid: seq char • cid ∈ dom connections ⇒
+    connections(cid).connectionId = cid
+
+
+/*
+ * WebSocket Message Types
+ */
+WSMessageType ::= connection_init 
+                | connection_ack 
+                | subscribe 
+                | next 
+                | complete 
+                | ping 
+                | pong
+
+
+/*
+ * WebSocket Message
+ * 
+ * Represents a message sent over WebSocket connection.
+ */
+schema WebSocketMessage
+  id: seq char ∪ {null}
+  type: WSMessageType
+  payload: seq char ∪ {null}
+where
+  /* Subscribe messages must have an id */
+  type = subscribe ⇒ id ≠ null ∧ payload ≠ null
+
+
+/*
+ * Operation: Handle WebSocket Connection
+ * 
+ * Handles a new WebSocket connection for subscriptions.
+ * 
+ * Corresponds to: Apollo Server subscription setup
+ */
+schema HandleWebSocketConnection
+  ΔApplicationState
+  ΔWebSocketConnections
+  request?: HTTPRequest
+  connectionId!: seq char
+  success!: 𝔹
+where
+  /* Generate unique connection ID */
+  connectionId! ∉ dom connections ∧
+  /* Create new WebSocket connection */
+  let newConnection == WebSocketConnection' |
+    newConnection.connectionId = connectionId! ∧
+    newConnection.sessionId = /* extract from request */ ∧
+    newConnection.protocol = "graphql-ws" ∧
+    newConnection.state = "connecting" ∧
+    newConnection.lastPing = /* current time */ •
+    connections' = connections ⊕ {connectionId! ↦ newConnection} ∧
+    success! = true
+
+
+/*
+ * Operation: Handle Subscription Message
+ * 
+ * Processes a subscription request from WebSocket client.
+ * 
+ * Corresponds to: GraphQL subscription resolver execution
+ */
+schema HandleSubscriptionMessage
+  ΔApplicationState
+  ΔPubSubState
+  connectionId?: seq char
+  message?: WebSocketMessage
+  subscriptionId!: seq char
+  success!: 𝔹
+where
+  message?.type = subscribe ⇒
+    (/* Parse subscription query from payload */
+     let query == /* GraphQL.parse(message?.payload) */ •
+       /* Extract subscription name (messageAdded, chatAdded, etc.) */
+       let subscriptionName == /* extract from query */ •
+         /* Create subscription using appropriate schema */
+         /* (SubscribeMessageAdded, SubscribeChatAdded, etc.) */
+         subscriptionId! ∉ dom pubsubState.subscriptions ∧
+         success! = true
+    )
+
+
+/*
+ * Operation: Send Subscription Data
+ * 
+ * Sends subscription data to WebSocket client when event occurs.
+ * 
+ * Corresponds to: WebSocket send() when event is published
+ */
+schema SendSubscriptionData
+  ΞApplicationState
+  ΞWebSocketConnections
+  subscriptionId?: seq char
+  event?: PubSubEvent
+  data?: Message ∪ Chat ∪ ChatID
+where
+  subscriptionId? ∈ dom pubsubState.subscriptions ⇒
+    let subscription == pubsubState.subscriptions(subscriptionId?) •
+      let session == activeSessions.sessions(subscription.sessionId) •
+        /* Apply subscription filter */
+        subscription.filter(event?, session) ⇒
+          /* Resolve GraphQL fields for data */
+          let resolvedData == /* resolve GraphQL fields */ •
+            /* Send message over WebSocket */
+            let wsMessage == WebSocketMessage' |
+              wsMessage.id = subscription.subscriptionId ∧
+              wsMessage.type = next ∧
+              wsMessage.payload = /* JSON.stringify(resolvedData) */ •
+              /* WebSocket.send(wsMessage) */
+              true
+
+
+/*******************************************************************************
+ * SECTION 4: REST DATA SOURCE PATTERN
+ ******************************************************************************/
+
+/*
+ * REST Data Source Configuration
+ * 
+ * Base configuration for Apollo REST Data Source.
+ */
+schema RESTDataSourceConfig
+  baseURL: URL
+  requestTimeout: ℕ
+  cacheTTL: ℕ
+  headers: seq char ⇸ seq char
+where
+  #baseURL > 0 ∧
+  requestTimeout > 0 ∧
+  cacheTTL > 0
+
+
+/*
+ * HTTP Request with Data Source
+ * 
+ * Generic HTTP request using REST Data Source.
+ */
+schema RESTDataSourceRequest[Params, Response]
+  ΞRESTDataSourceConfig
+  ΞRESTDataSourceCache
+  method: seq char
+  path: seq char
+  params: Params
+  response!: Response
+  cacheHit!: 𝔹
+where
+  method ∈ {"GET", "POST", "PUT", "DELETE", "PATCH"}
+
+
+/*
+ * Operation: Generic GET Request with Caching
+ * 
+ * Performs a GET request with automatic caching.
+ * Implements the RESTDataSource caching strategy.
+ */
+schema CachedGETRequest[Response]
+  RESTDataSourceConfig
+  ΔRESTDataSourceCache
+  path?: seq char
+  queryParams?: seq char ⇸ seq char
+  response!: Response
+  fromCache!: 𝔹
+where
+  /* Build full URL with query params */
+  let fullURL == baseURL ⌢ path? ⌢ 
+                 /* serialize queryParams */ •
+    /* Check cache */
+    (fullURL ∈ dom urlCache ⇒
+      let (cachedResponse, timestamp) == urlCache(fullURL) •
+        (/* Check if cache is valid */
+         /* current_time - timestamp < cacheTTL */ ⇒
+           (response! = /* deserialize(cachedResponse) */ ∧
+            fromCache! = true)
+         ⊕
+           /* Cache expired - fetch fresh */
+           let freshResponse == /* HTTP GET fullURL */ •
+             urlCache' = urlCache ⊕ 
+               {fullURL ↦ (/* serialize(freshResponse) */, /* current_time */)} ∧
+             response! = freshResponse ∧
+             fromCache! = false
+        )
+    )
+    ⊕
+      /* Not in cache - fetch and cache */
+      let freshResponse == /* HTTP GET fullURL */ •
+        urlCache' = urlCache ⊕ 
+          {fullURL ↦ (/* serialize(freshResponse) */, /* current_time */)} ∧
+        response! = freshResponse ∧
+        fromCache! = false
+
+
+/*******************************************************************************
+ * SECTION 5: ERROR HANDLING FOR EXTERNAL INTEGRATIONS
+ ******************************************************************************/
+
+/*
+ * External Service Error
+ * 
+ * Represents an error from an external service.
+ */
+schema ExternalServiceError
+  serviceName: seq char
+  errorType: seq char
+  statusCode: ℕ ∪ {null}
+  errorMessage: seq char
+  timestamp: DateTime
+  retryable: 𝔹
+where
+  serviceName ∈ {"unsplash", "postgres-pubsub"} ∧
+  errorType ∈ {"network_error", "timeout", "rate_limit", 
+                "auth_error", "server_error", "client_error"}
+
+
+/*
+ * Operation: Handle External Service Error
+ * 
+ * Generic error handling for external service failures.
+ * Implements retry logic and fallback strategies.
+ */
+schema HandleExternalServiceError
+  ΞApplicationState
+  error?: ExternalServiceError
+  fallbackData!: seq char ∪ {null}
+  shouldRetry!: 𝔹
+  retryAfter!: ℕ
+where
+  /* Determine if error is retryable */
+  shouldRetry! = error?.retryable ∧
+    error?.errorType ∈ {"network_error", "timeout", "rate_limit"}
+  ∧
+  /* Set retry delay based on error type */
+  (error?.errorType = "rate_limit" ⇒
+    retryAfter! = 3600000  // 1 hour for rate limits
+  )
+  ⊕ (error?.errorType = "timeout" ⇒
+    retryAfter! = 5000  // 5 seconds for timeouts
+  )
+  ⊕ (error?.errorType = "network_error" ⇒
+    retryAfter! = 10000  // 10 seconds for network errors
+  )
+  ∧
+  /* Provide fallback data if available */
+  (error?.serviceName = "unsplash" ⇒
+    fallbackData! = "https://randomuser.me/api/portraits/thumb/lego/1.jpg"
+  )
+  ⊕
+    fallbackData! = null
+
+
+/*******************************************************************************
+ * SECTION 6: INTEGRATION HEALTH MONITORING
+ ******************************************************************************/
+
+/*
+ * External Service Health Status
+ * 
+ * Tracks the health of external service integrations.
+ */
+schema ServiceHealthStatus
+  serviceName: seq char
+  status: seq char
+  lastSuccessfulRequest: DateTime
+  lastFailedRequest: DateTime
+  consecutiveFailures: ℕ
+  averageLatency: ℕ
+where
+  serviceName ∈ {"unsplash", "postgres-pubsub"} ∧
+  status ∈ {"healthy", "degraded", "unavailable"}
+
+
+/*
+ * Operation: Check Service Health
+ * 
+ * Performs a health check on an external service.
+ */
+schema CheckServiceHealth
+  ΞApplicationState
+  serviceName?: seq char
+  health!: ServiceHealthStatus
+where
+  serviceName? ∈ {"unsplash", "postgres-pubsub"} ⇒
+    /* Perform lightweight health check request */
+    let healthCheck == /* service-specific health check */ •
+      health!.serviceName = serviceName? ∧
+      /* Determine status based on recent history */
+      (health!.consecutiveFailures < 3 ⇒
+        health!.status = "healthy"
+      )
+      ⊕ (health!.consecutiveFailures < 10 ⇒
+        health!.status = "degraded"
+      )
+      ⊕
+        health!.status = "unavailable"
+
+
+/*******************************************************************************
+ * SECTION 7: DATA TRANSFORMATION CONTRACTS
+ ******************************************************************************/
+
+/*
+ * Data Transformation: External to Internal
+ * 
+ * Transforms external API responses to internal data models.
+ */
+schema TransformExternalToInternal[External, Internal]
+  external?: External
+  internal!: Internal
+where
+  /* Transformation logic depends on types */
+  /* For Unsplash: extract photo URL from complex response */
+  /* For PubSub: deserialize event payload */
+  true
+
+
+/*
+ * Unsplash Photo to URL Transformation
+ * 
+ * Extracts the appropriate photo URL from Unsplash response.
+ */
+schema TransformUnsplashPhotoToURL
+  TransformExternalToInternal[UnsplashPhoto, URL]
+where
+  external? ≠ null ⇒
+    internal! = external?.urls("regular")
+
+
+/*
+ * PostgreSQL Notification to Event Transformation
+ * 
+ * Transforms PostgreSQL NOTIFY payload to PubSubEvent.
+ */
+schema TransformPostgresNotificationToEvent
+  TransformExternalToInternal[PostgresNotifyPayload, PubSubEvent]
+where
+  external? ≠ null ⇒
+    let eventType == 
+      (external?.channel = "messageAdded" ⇒ messageAdded)
+      ⊕ (external?.channel = "chatAdded" ⇒ chatAdded)
+      ⊕ (external?.channel = "chatRemoved" ⇒ chatRemoved) •
+      internal!.eventType = eventType ∧
+      internal!.payload = /* deserialize external?.payload */ ∧
+      internal!.timestamp = external?.timestamp
+
+
+/*******************************************************************************
+ * END OF INTEGRATIONS SPECIFICATION
+ ******************************************************************************/
+
+/*
+ * NOTES ON IMPLEMENTATION:
+ * 
+ * 1. Unsplash API Integration:
+ *    - Uses Apollo RESTDataSource for HTTP caching
+ *    - Rate limited to 50 requests/hour (demo tier)
+ *    - Fallback to default images on failure
+ *    - Cache TTL configured per request type
+ * 
+ * 2. PostgreSQL PubSub:
+ *    - Uses graphql-postgres-subscriptions package
+ *    - LISTEN/NOTIFY provides scalable real-time events
+ *    - Events distributed across all server instances
+ *    - Subscription filters applied per client
+ * 
+ * 3. GraphQL Subscriptions:
+ *    - WebSocket protocol: graphql-ws
+ *    - Connection lifecycle: init, ack, subscribe, next, complete
+ *    - Apollo Server manages WebSocket connections
+ *    - Subscriptions tied to authenticated sessions
+ * 
+ * 4. REST Data Source:
+ *    - Automatic request/response caching
+ *    - Configurable TTL per endpoint
+ *    - Retry logic for transient failures
+ *    - Circuit breaker pattern for failing services
+ * 
+ * 5. Error Handling:
+ *    - Graceful degradation on external service failures
+ *    - Fallback data provided when available
+ *    - Exponential backoff for retries
+ *    - Health monitoring for service status
+ * 
+ * 6. Data Transformation:
+ *    - External API responses mapped to internal types
+ *    - Type safety maintained throughout
+ *    - Validation at integration boundaries
+ *    - Schema evolution handled with versioning
+ */

@@ -1,0 +1,782 @@
+/*******************************************************************************
+ * WhatsApp Clone - Core Operations Formal Specification (Z++)
+ * 
+ * This specification formalizes the core backend operations including:
+ * - Authentication operations (signIn, signUp)
+ * - Data mutation operations (addMessage, addChat, removeChat)
+ * - Data retrieval operations (queries)
+ * 
+ * All operations maintain system invariants and handle error conditions.
+ ******************************************************************************/
+
+include "data_model.zpp"
+include "system_state.zpp"
+
+
+/*******************************************************************************
+ * SECTION 1: AUTHENTICATION OPERATIONS
+ ******************************************************************************/
+
+/*
+ * Operation: Sign In
+ * 
+ * Authenticates a user with username and password.
+ * Sets authentication cookie in response on success.
+ * 
+ * Corresponds to: Auth.signIn({username, password})
+ * GraphQL Mutation: signIn(username: String!, password: String!): User
+ */
+schema SignIn
+  ΔApplicationState
+  ΔAuthContext
+  username?: Username
+  password?: seq char
+  user!: User
+  success!: 𝔹
+where
+  /* Pre-conditions */
+  validUsername(username?) ∧
+  #password? ≥ MIN_PASSWORD_LENGTH
+  ∧
+  /* Find user by username */
+  (∃ uid: UserID • uid ∈ dom users ∧ users(uid).username = username? ⇒
+    let targetUser == users(uid) •
+      /* Verify password using bcrypt */
+      /* bcrypt.compareSync(password?, targetUser.password) */
+      (/* password matches */ ⇒
+        (/* Generate JWT token */
+         let token == signJWT(username?, authConfig.jwtSecret) •
+           /* Set auth cookie in response */
+           response'.cookies = response.cookies ⌢ 
+             ⟨AuthCookie' | 
+               name = "authToken" ∧ 
+               value = token ∧ 
+               maxAge = authConfig.tokenExpiration ∧
+               httpOnly = true⟩
+           ∧
+           /* Update session state */
+           currentUser' = uid ∧
+           authenticated' = true ∧
+           /* Return user */
+           user! = targetUser ∧
+           success! = true
+        )
+      ⊕
+        /* Password does not match */
+        (success! = false ∧
+         /* Error: "password is incorrect" */
+         user! = null)
+      )
+  )
+  ⊕
+    /* User not found */
+    (success! = false ∧
+     /* Error: "user not found" */
+     user! = null)
+  ∧
+  /* Database state unchanged (read-only operation) */
+  DatabaseState' = DatabaseState
+
+
+/*
+ * Operation: Sign Up
+ * 
+ * Creates a new user account with validation.
+ * Automatically signs in the new user on success.
+ * 
+ * Corresponds to: Auth.signUp({name, username, password, passwordConfirm})
+ * GraphQL Mutation: signUp(name: String!, username: String!, 
+ *                           password: String!, passwordConfirm: String!): User
+ */
+schema SignUp
+  ΔApplicationState
+  ΔAuthContext
+  name?: UserName
+  username?: Username
+  password?: seq char
+  passwordConfirm?: seq char
+  user!: User
+  newUserId!: UserID
+  success!: 𝔹
+where
+  /* Pre-conditions: Input validation */
+  validUsername(username?) ∧
+  MIN_NAME_LENGTH ≤ #name? ∧ #name? ≤ MAX_NAME_LENGTH ∧
+  validPassword(password?) ∧
+  password? = passwordConfirm?
+  ∧
+  /* Check username availability */
+  (¬(∃ uid: UserID • uid ∈ dom users ∧ users(uid).username = username?) ⇒
+    /* Username is available */
+    (/* Generate new user ID */
+     newUserId! ∉ dom users ∧
+     /* Hash password with bcrypt */
+     let hashedPassword == /* bcrypt.hashSync(password?, 8) */ •
+       /* Create new user */
+       let newUser == User' |
+         newUser.id = newUserId! ∧
+         newUser.username = username? ∧
+         newUser.name = name? ∧
+         newUser.password = hashedPassword ∧
+         newUser.picture = /* default picture URL */ •
+         /* Add user to database */
+         users' = users ⊕ {newUserId! ↦ newUser} ∧
+         /* Automatically sign in the new user */
+         let token == signJWT(username?, authConfig.jwtSecret) •
+           response'.cookies = response.cookies ⌢ 
+             ⟨AuthCookie' | 
+               name = "authToken" ∧ 
+               value = token ∧ 
+               maxAge = authConfig.tokenExpiration ∧
+               httpOnly = true⟩ ∧
+           currentUser' = newUserId! ∧
+           authenticated' = true ∧
+           user! = newUser ∧
+           success! = true
+    )
+  )
+  ⊕
+    /* Username already exists */
+    (success! = false ∧
+     /* Error: "username already exists" */
+     user! = null ∧
+     DatabaseState' = DatabaseState)
+  ∧
+  /* Maintain database integrity */
+  ∀ uid: UserID • uid ∈ dom users' ⇒
+    (uid ∈ dom users ∨ uid = newUserId!)
+
+
+/*
+ * Operation: Get Current User
+ * 
+ * Retrieves the currently authenticated user from session.
+ * Verifies JWT token if present and caches the result.
+ * 
+ * Corresponds to: Auth.currentUser()
+ * GraphQL Query: me: User
+ */
+schema GetCurrentUser
+  ΞApplicationState
+  ΞAuthContext
+  user!: User ∪ {null}
+where
+  /* Check if user already cached in session */
+  (currentUser ≠ null ⇒
+    user! = users(currentUser)
+  )
+  ⊕
+    /* Check for auth token in cookies */
+    ("authToken" ∈ dom request.cookies ⇒
+      let token == request.cookies("authToken") •
+        let username == verifyJWT(token, authConfig.jwtSecret, /* current time */) •
+          (username ≠ null ⇒
+            /* Find user by username */
+            (∃ uid: UserID • uid ∈ dom users ∧ users(uid).username = username ⇒
+              user! = users(uid)
+            )
+          )
+          ⊕
+            /* Token invalid or expired */
+            user! = null
+    )
+    ⊕
+      /* No auth token present */
+      user! = null
+
+
+/*******************************************************************************
+ * SECTION 2: CHAT QUERY OPERATIONS
+ ******************************************************************************/
+
+/*
+ * Operation: Get Chats for User
+ * 
+ * Retrieves all chats where the current user is a participant.
+ * 
+ * Corresponds to: Query.chats resolver
+ * GraphQL Query: chats: [Chat!]!
+ */
+schema GetChats
+  ΞApplicationState
+  AuthContext
+  chats!: seq Chat
+where
+  /* Pre-condition: User must be authenticated */
+  authenticated = true ∧ currentUser ≠ null
+  ⇒
+    /* Get all chats for current user */
+    chats! = ⟨chats(cid) | cid: ChatID • 
+      cid ∈ userChats(currentUser, participants)⟩
+  ⊕
+    /* Not authenticated - return empty list */
+    chats! = ⟨⟩
+
+
+/*
+ * Operation: Get Single Chat
+ * 
+ * Retrieves a specific chat if the current user is a participant.
+ * 
+ * Corresponds to: Query.chat(chatId) resolver
+ * GraphQL Query: chat(chatId: ID!): Chat
+ */
+schema GetChat
+  ΞApplicationState
+  AuthContext
+  chatId?: ChatID
+  chat!: Chat ∪ {null}
+where
+  /* Pre-condition: User must be authenticated */
+  authenticated = true ∧ currentUser ≠ null
+  ⇒
+    (/* Check if chat exists and user is participant */
+     chatId? ∈ dom chats ∧ 
+     isParticipant(currentUser, chatId?, participants)
+     ⇒
+       chat! = chats(chatId?)
+     ⊕
+       /* Chat not found or not a participant */
+       chat! = null
+    )
+  ⊕
+    /* Not authenticated */
+    chat! = null
+
+
+/*
+ * Operation: Get Chat Messages with Pagination
+ * 
+ * Retrieves messages for a chat with pagination support.
+ * Messages returned in descending order (newest first).
+ * 
+ * Corresponds to: Chat.messages resolver
+ * GraphQL Field: Chat.messages(limit: Int!, after: Float): MessagesResult!
+ */
+schema GetChatMessages
+  ΞApplicationState
+  AuthContext
+  chatId?: ChatID
+  limit?: ℕ
+  after?: DateTime ∪ {null}
+  messages!: seq Message
+  hasMore!: 𝔹
+  cursor!: DateTime ∪ {null}
+where
+  /* Pre-condition: User must be authenticated and be participant */
+  authenticated = true ∧ 
+  currentUser ≠ null ∧
+  chatId? ∈ dom chats ∧
+  isParticipant(currentUser, chatId?, participants)
+  ⇒
+    (/* Get all messages for chat */
+     let allMessages == chatMessages(chatId?, messages) •
+       /* Filter by cursor if provided */
+       let filteredMessages == 
+         (after? ≠ null ⇒ 
+           ⟨m: Message | m ∈ allMessages ∧ m.created_at < after?⟩
+         ⊕
+           allMessages) •
+         /* Reverse order (newest first) and apply limit */
+         let reversedMessages == rev filteredMessages •
+           (#reversedMessages ≤ limit? ⇒
+             (messages! = take(#reversedMessages, reversedMessages) ∧
+              hasMore! = false ∧
+              cursor! = null)
+           ⊕
+             (messages! = take(limit?, reversedMessages) ∧
+              hasMore! = true ∧
+              cursor! = (last messages!).created_at)
+           )
+    )
+  ⊕
+    /* Not authorized */
+    (messages! = ⟨⟩ ∧ hasMore! = false ∧ cursor! = null)
+
+
+/*
+ * Operation: Get Users (excluding current user)
+ * 
+ * Retrieves all users except the current user.
+ * Used for creating new chats.
+ * 
+ * Corresponds to: Query.users resolver
+ * GraphQL Query: users: [User!]!
+ */
+schema GetUsers
+  ΞApplicationState
+  AuthContext
+  users!: seq User
+where
+  /* Pre-condition: User must be authenticated */
+  authenticated = true ∧ currentUser ≠ null
+  ⇒
+    users! = ⟨users(uid) | uid: UserID • 
+      uid ∈ dom users ∧ uid ≠ currentUser⟩
+  ⊕
+    /* Not authenticated - return empty list */
+    users! = ⟨⟩
+
+
+/*******************************************************************************
+ * SECTION 3: MESSAGE MUTATION OPERATIONS
+ ******************************************************************************/
+
+/*
+ * Operation: Add Message
+ * 
+ * Adds a new message to a chat.
+ * Publishes messageAdded event to subscribers.
+ * 
+ * Corresponds to: Mutation.addMessage(chatId, content)
+ * GraphQL Mutation: addMessage(chatId: ID!, content: String!): Message
+ */
+schema AddMessage
+  ΔApplicationState
+  AuthContext
+  chatId?: ChatID
+  content?: MessageContent
+  message!: Message
+  newMessageId!: MessageID
+  success!: 𝔹
+where
+  /* Pre-conditions */
+  authenticated = true ∧
+  currentUser ≠ null ∧
+  validMessageContent(content?) ∧
+  chatId? ∈ dom chats ∧
+  isParticipant(currentUser, chatId?, participants)
+  ⇒
+    (/* Generate new message ID */
+     newMessageId! ∉ dom messages ∧
+     /* Create new message */
+     let newMessage == Message' |
+       newMessage.id = newMessageId! ∧
+       newMessage.content = content? ∧
+       newMessage.created_at = /* current timestamp */ ∧
+       newMessage.chat_id = chatId? ∧
+       newMessage.sender_user_id = currentUser •
+       /* Add message to database */
+       messages' = messages ⊕ {newMessageId! ↦ newMessage} ∧
+       message! = newMessage ∧
+       success! = true ∧
+       /* Publish event to PubSub */
+       let event == PubSubEvent' |
+         event.eventType = messageAdded ∧
+         event.payload = newMessageId! ∧
+         event.timestamp = newMessage.created_at •
+         pubsubState'.eventQueue = pubsubState.eventQueue ⌢ ⟨event⟩
+    )
+  ⊕
+    /* Pre-conditions not met */
+    (success! = false ∧
+     message! = null ∧
+     DatabaseState' = DatabaseState ∧
+     pubsubState' = pubsubState)
+  ∧
+  /* Rest of state unchanged */
+  users' = users ∧
+  chats' = chats ∧
+  participants' = participants
+
+
+/*******************************************************************************
+ * SECTION 4: CHAT MUTATION OPERATIONS
+ ******************************************************************************/
+
+/*
+ * Operation: Add Chat
+ * 
+ * Creates a new chat between current user and recipient.
+ * Checks if chat already exists between the two users.
+ * 
+ * Corresponds to: Mutation.addChat(recipientId)
+ * GraphQL Mutation: addChat(recipientId: ID!): Chat
+ */
+schema AddChat
+  ΔApplicationState
+  AuthContext
+  recipientId?: UserID
+  chat!: Chat
+  newChatId!: ChatID
+  success!: 𝔹
+where
+  /* Pre-conditions */
+  authenticated = true ∧
+  currentUser ≠ null ∧
+  recipientId? ∈ dom users ∧
+  recipientId? ≠ currentUser
+  ⇒
+    (/* Check if chat already exists between these users */
+     let existingChats == userChats(currentUser, participants) ∩
+                          userChats(recipientId?, participants) •
+       (#existingChats = 0 ⇒
+         /* No existing chat - create new one */
+         (newChatId! ∉ dom chats ∧
+          /* Create new chat */
+          let newChat == Chat' | newChat.id = newChatId! •
+            chats' = chats ⊕ {newChatId! ↦ newChat} ∧
+            /* Add participants */
+            let p1 == ChatParticipant' |
+              p1.chat_id = newChatId! ∧ p1.user_id = currentUser •
+            let p2 == ChatParticipant' |
+              p2.chat_id = newChatId! ∧ p2.user_id = recipientId? •
+              participants' = participants ∪ {p1, p2} ∧
+              chat! = newChat ∧
+              success! = true ∧
+              /* Publish event to PubSub */
+              let event == PubSubEvent' |
+                event.eventType = chatAdded ∧
+                event.payload = newChatId! ∧
+                event.timestamp = /* current time */ •
+                pubsubState'.eventQueue = pubsubState.eventQueue ⌢ ⟨event⟩
+         )
+       ⊕
+         /* Chat already exists - return existing chat */
+         let existingChatId == /* first element of existingChats */ •
+           (chat! = chats(existingChatId) ∧
+            success! = true ∧
+            DatabaseState' = DatabaseState ∧
+            pubsubState' = pubsubState)
+       )
+    )
+  ⊕
+    /* Pre-conditions not met */
+    (success! = false ∧
+     chat! = null ∧
+     DatabaseState' = DatabaseState ∧
+     pubsubState' = pubsubState)
+  ∧
+  /* Rest of state unchanged */
+  users' = users ∧
+  messages' = messages
+
+
+/*
+ * Operation: Remove Chat
+ * 
+ * Removes a chat and all associated messages.
+ * Enforced by database CASCADE deletion.
+ * 
+ * Corresponds to: Mutation.removeChat(chatId)
+ * GraphQL Mutation: removeChat(chatId: ID!): ID
+ */
+schema RemoveChat
+  ΔApplicationState
+  AuthContext
+  chatId?: ChatID
+  removedChatId!: ChatID ∪ {null}
+  success!: 𝔹
+where
+  /* Pre-conditions */
+  authenticated = true ∧
+  currentUser ≠ null ∧
+  chatId? ∈ dom chats ∧
+  isParticipant(currentUser, chatId?, participants)
+  ⇒
+    (/* Remove chat */
+     chats' = chats ⊖ {chatId?} ∧
+     /* Remove all messages in this chat (CASCADE) */
+     messages' = {mid ↦ msg | mid: MessageID; msg: Message •
+       mid ∈ dom messages ∧ msg = messages(mid) ∧ msg.chat_id ≠ chatId?} ∧
+     /* Remove all participants (CASCADE) */
+     participants' = {p: ChatParticipant | 
+       p ∈ participants ∧ p.chat_id ≠ chatId?} ∧
+     removedChatId! = chatId? ∧
+     success! = true ∧
+     /* Publish event to PubSub */
+     let event == PubSubEvent' |
+       event.eventType = chatRemoved ∧
+       event.payload = chatId? ∧
+       event.timestamp = /* current time */ •
+       pubsubState'.eventQueue = pubsubState.eventQueue ⌢ ⟨event⟩
+    )
+  ⊕
+    /* Pre-conditions not met */
+    (success! = false ∧
+     removedChatId! = null ∧
+     DatabaseState' = DatabaseState ∧
+     pubsubState' = pubsubState)
+  ∧
+  /* Rest of state unchanged */
+  users' = users
+
+
+/*******************************************************************************
+ * SECTION 5: SUBSCRIPTION OPERATIONS
+ ******************************************************************************/
+
+/*
+ * Operation: Subscribe to Message Added
+ * 
+ * Creates a subscription to receive messageAdded events.
+ * Only receives events for chats where user is a participant.
+ * 
+ * Corresponds to: Subscription.messageAdded
+ * GraphQL Subscription: messageAdded: Message!
+ */
+schema SubscribeMessageAdded
+  ΔApplicationState
+  AuthContext
+  subscriptionId!: seq char
+  success!: 𝔹
+where
+  /* Pre-condition: User must be authenticated */
+  authenticated = true ∧ currentUser ≠ null
+  ⇒
+    (/* Create subscription with filter */
+     let filter == λ event: PubSubEvent; session: SessionState •
+       event.eventType = messageAdded ⇒
+         let messageId == event.payload •
+           messageId ∈ dom messages ⇒
+             let message == messages(messageId) •
+               isParticipant(session.currentUser, message.chat_id, participants) •
+     /* Generate unique subscription ID */
+     subscriptionId! ∉ dom pubsubState.subscriptions ∧
+     /* Create subscription */
+     let newSub == ActiveSubscription' |
+       newSub.subscriptionId = subscriptionId! ∧
+       newSub.sessionId = sessionId ∧
+       newSub.eventType = messageAdded ∧
+       newSub.filter = filter ∧
+       newSub.createdAt = /* current time */ •
+       pubsubState'.subscriptions = 
+         pubsubState.subscriptions ⊕ {subscriptionId! ↦ newSub} ∧
+       success! = true
+    )
+  ⊕
+    /* Not authenticated */
+    (success! = false ∧
+     pubsubState' = pubsubState)
+  ∧
+  /* Database state unchanged */
+  DatabaseState' = DatabaseState
+
+
+/*
+ * Operation: Subscribe to Chat Added
+ * 
+ * Creates a subscription to receive chatAdded events.
+ * Only receives events for chats where user is a participant.
+ * 
+ * Corresponds to: Subscription.chatAdded
+ * GraphQL Subscription: chatAdded: Chat!
+ */
+schema SubscribeChatAdded
+  ΔApplicationState
+  AuthContext
+  subscriptionId!: seq char
+  success!: 𝔹
+where
+  /* Pre-condition: User must be authenticated */
+  authenticated = true ∧ currentUser ≠ null
+  ⇒
+    (/* Create subscription with filter */
+     let filter == λ event: PubSubEvent; session: SessionState •
+       event.eventType = chatAdded ⇒
+         let chatId == event.payload •
+           isParticipant(session.currentUser, chatId, participants) •
+     /* Generate unique subscription ID */
+     subscriptionId! ∉ dom pubsubState.subscriptions ∧
+     /* Create subscription (similar to SubscribeMessageAdded) */
+     success! = true ∧
+     /* Implementation details omitted for brevity */
+     true
+    )
+  ⊕
+    /* Not authenticated */
+    (success! = false ∧
+     pubsubState' = pubsubState)
+  ∧
+  /* Database state unchanged */
+  DatabaseState' = DatabaseState
+
+
+/*
+ * Operation: Subscribe to Chat Removed
+ * 
+ * Creates a subscription to receive chatRemoved events.
+ * Only receives events for chats where user was a participant.
+ * 
+ * Corresponds to: Subscription.chatRemoved
+ * GraphQL Subscription: chatRemoved: ID!
+ */
+schema SubscribeChatRemoved
+  ΔApplicationState
+  AuthContext
+  subscriptionId!: seq char
+  success!: 𝔹
+where
+  /* Similar to SubscribeChatAdded */
+  /* Implementation details omitted for brevity */
+  true
+
+
+/*******************************************************************************
+ * SECTION 6: OPERATION COMPOSITION AND ERROR HANDLING
+ ******************************************************************************/
+
+/*
+ * Generic Error Response
+ * 
+ * Represents an error that can be returned by any operation.
+ */
+schema OperationError
+  errorCode: seq char
+  errorMessage: seq char
+  timestamp: DateTime
+where
+  #errorCode > 0 ∧
+  #errorMessage > 0
+
+
+/*
+ * Common error codes used throughout the system:
+ */
+given
+  ERROR_UNAUTHENTICATED == "UNAUTHENTICATED"
+  ERROR_UNAUTHORIZED == "UNAUTHORIZED"
+  ERROR_NOT_FOUND == "NOT_FOUND"
+  ERROR_INVALID_INPUT == "INVALID_INPUT"
+  ERROR_DUPLICATE_ENTRY == "DUPLICATE_ENTRY"
+  ERROR_INTERNAL_ERROR == "INTERNAL_ERROR"
+
+
+/*
+ * Operation Result (Generic)
+ * 
+ * Generic result type for operations that can succeed or fail.
+ */
+schema OperationResult[T]
+  success: 𝔹
+  data: T ∪ {null}
+  error: OperationError ∪ {null}
+where
+  /* If successful, data is not null and error is null */
+  success = true ⇒ (data ≠ null ∧ error = null)
+  ∧
+  /* If failed, data is null and error is not null */
+  success = false ⇒ (data = null ∧ error ≠ null)
+
+
+/*
+ * Authorization Check Helper
+ * 
+ * Generic authorization check for operations requiring authentication.
+ */
+schema RequireAuthentication
+  AuthContext
+  authorized!: 𝔹
+where
+  authorized! = (authenticated = true ∧ currentUser ≠ null)
+
+
+/*
+ * Authorization Check for Chat Access
+ * 
+ * Checks if current user can access a specific chat.
+ */
+schema RequireChatAccess
+  AuthContext
+  DatabaseState
+  chatId?: ChatID
+  authorized!: 𝔹
+where
+  chatId? ∈ dom chats ∧
+  authenticated = true ∧
+  currentUser ≠ null
+  ⇒
+    authorized! = isParticipant(currentUser, chatId?, participants)
+  ⊕
+    authorized! = false
+
+
+/*******************************************************************************
+ * SECTION 7: TRANSACTION SEMANTICS
+ ******************************************************************************/
+
+/*
+ * Database Transaction State
+ * 
+ * Represents a database transaction in progress.
+ */
+schema Transaction
+  transactionId: seq char
+  operations: seq (seq char)  // Operation names
+  startTime: DateTime
+  isolationLevel: seq char
+  status: seq char
+where
+  #transactionId > 0 ∧
+  status ∈ {"active", "committed", "rolled_back"} ∧
+  isolationLevel ∈ {"read_uncommitted", "read_committed", 
+                     "repeatable_read", "serializable"}
+
+
+/*
+ * Atomic Operation Execution
+ * 
+ * Ensures that operations are executed atomically.
+ * If any operation fails, all changes are rolled back.
+ */
+schema AtomicExecution[Op]
+  transaction: Transaction
+  initialState: ApplicationState
+  finalState: ApplicationState
+  operation: Op
+  committed: 𝔹
+where
+  transaction.status = "active" ⇒
+    (/* Execute operation */
+     committed = true ⇒
+       (finalState = /* result of operation */ ∧
+        transaction.status = "committed")
+     ⊕
+       /* Rollback on failure */
+       (finalState = initialState ∧
+        transaction.status = "rolled_back")
+    )
+
+
+/*******************************************************************************
+ * END OF OPERATIONS SPECIFICATION
+ ******************************************************************************/
+
+/*
+ * NOTES ON IMPLEMENTATION:
+ * 
+ * 1. Password Hashing:
+ *    - bcrypt.hashSync(password, 8) for signup
+ *    - bcrypt.compareSync(password, hash) for signin
+ *    - Computational cost parameter: 8 rounds
+ * 
+ * 2. JWT Token Generation:
+ *    - jwt.sign(username, secret) creates token
+ *    - jwt.verify(token, secret) validates token
+ *    - Tokens stored in HTTP-only cookies
+ * 
+ * 3. Transaction Guarantees:
+ *    - PostgreSQL provides ACID transactions
+ *    - All mutations wrapped in database transactions
+ *    - Rollback on error maintains consistency
+ * 
+ * 4. Authorization Model:
+ *    - Current user extracted from JWT token
+ *    - Operations check authentication status
+ *    - Chat access requires participant membership
+ * 
+ * 5. Real-time Updates:
+ *    - PubSub events published after successful mutations
+ *    - Subscription filters ensure proper event routing
+ *    - WebSocket connections managed by Apollo Server
+ * 
+ * 6. Error Handling:
+ *    - All operations return success indicator
+ *    - Errors include descriptive messages
+ *    - GraphQL errors propagated to client
+ * 
+ * 7. Pagination:
+ *    - Cursor-based pagination for messages
+ *    - Efficient for large message histories
+ *    - Supports infinite scroll pattern
+ */
