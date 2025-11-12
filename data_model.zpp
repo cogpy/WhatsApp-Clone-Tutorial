@@ -1,0 +1,575 @@
+/*******************************************************************************
+ * WhatsApp Clone - Data Model Formal Specification (Z++)
+ * 
+ * This specification formalizes the data layer of the WhatsApp Clone backend,
+ * including all database entities, their relationships, and data invariants.
+ * 
+ * Based on PostgreSQL schema defined in db.ts
+ ******************************************************************************/
+
+/*******************************************************************************
+ * SECTION 1: BASE TYPES AND CONSTANTS
+ ******************************************************************************/
+
+/* Basic Types */
+[UserID, ChatID, MessageID]  // Distinct identifier types
+
+/* String Constraints */
+given
+  MIN_USERNAME_LENGTH == 3
+  MAX_USERNAME_LENGTH == 18
+  MIN_NAME_LENGTH == 3
+  MAX_NAME_LENGTH == 50
+  MIN_PASSWORD_LENGTH == 8
+  MAX_MESSAGE_LENGTH == 355
+
+/* Type Definitions for Constrained Strings */
+Username == {s: seq char | MIN_USERNAME_LENGTH ≤ #s ∧ #s ≤ MAX_USERNAME_LENGTH}
+UserName == {s: seq char | MIN_NAME_LENGTH ≤ #s ∧ #s ≤ MAX_NAME_LENGTH}
+Password == {s: seq char | MIN_PASSWORD_LENGTH ≤ #s}
+HashedPassword == seq char  // bcrypt hash format: $2a$08$...
+MessageContent == {s: seq char | 1 ≤ #s ∧ #s ≤ MAX_MESSAGE_LENGTH}
+URL == seq char  // URL format for pictures
+DateTime == ℕ  // Unix timestamp in milliseconds
+
+
+/*******************************************************************************
+ * SECTION 2: CORE DATA ENTITIES
+ ******************************************************************************/
+
+/*
+ * User Entity
+ * 
+ * Represents a user account in the system.
+ * Maps to the 'users' table in PostgreSQL.
+ * 
+ * Database Schema:
+ *   CREATE TABLE users(
+ *     id SERIAL PRIMARY KEY,
+ *     username VARCHAR (50) UNIQUE NOT NULL,
+ *     name VARCHAR (50) NOT NULL,
+ *     password VARCHAR (255) NOT NULL,  -- bcrypt hashed
+ *     picture VARCHAR (255) NOT NULL
+ *   );
+ */
+schema User
+  id: UserID
+  username: Username
+  name: UserName
+  password: HashedPassword
+  picture: URL
+where
+  /* Username uniqueness enforced by database UNIQUE constraint */
+  /* Password stored as bcrypt hash, never plaintext */
+  /* Picture URL must be valid, either from Unsplash or randomuser.me */
+  true
+
+
+/*
+ * Chat Entity
+ * 
+ * Represents a conversation between two or more users.
+ * Maps to the 'chats' table in PostgreSQL.
+ * 
+ * Database Schema:
+ *   CREATE TABLE chats(
+ *     id SERIAL PRIMARY KEY
+ *   );
+ * 
+ * Note: The chat entity is minimal in the database. Additional properties
+ * like name and picture are derived from participants at query time.
+ */
+schema Chat
+  id: ChatID
+where
+  true
+
+
+/*
+ * Message Entity
+ * 
+ * Represents a message sent in a chat by a user.
+ * Maps to the 'messages' table in PostgreSQL.
+ * 
+ * Database Schema:
+ *   CREATE TABLE messages(
+ *     id SERIAL PRIMARY KEY,
+ *     content VARCHAR (355) NOT NULL,
+ *     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+ *     chat_id INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+ *     sender_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE
+ *   );
+ */
+schema Message
+  id: MessageID
+  content: MessageContent
+  created_at: DateTime
+  chat_id: ChatID
+  sender_user_id: UserID
+where
+  /* Content must not be empty */
+  #content > 0
+  ∧
+  /* Timestamp must be valid (not in future, not before epoch) */
+  created_at > 0
+
+
+/*
+ * ChatParticipant Relationship
+ * 
+ * Represents the many-to-many relationship between chats and users.
+ * Maps to the 'chats_users' join table in PostgreSQL.
+ * 
+ * Database Schema:
+ *   CREATE TABLE chats_users(
+ *     chat_id INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+ *     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE
+ *   );
+ */
+schema ChatParticipant
+  chat_id: ChatID
+  user_id: UserID
+where
+  /* Both foreign keys must be valid */
+  true
+
+
+/*******************************************************************************
+ * SECTION 3: COLLECTION SCHEMAS
+ ******************************************************************************/
+
+/*
+ * Users Collection
+ * 
+ * The complete set of all users in the system.
+ */
+schema Users
+  users: UserID ⇸ User
+where
+  /* All user IDs in the mapping correspond to the user's id field */
+  ∀ uid: UserID • uid ∈ dom users ⇒ users(uid).id = uid
+  ∧
+  /* Username uniqueness: No two distinct users can have the same username */
+  ∀ uid1, uid2: UserID • 
+    uid1 ∈ dom users ∧ uid2 ∈ dom users ∧ uid1 ≠ uid2 ⇒ 
+    users(uid1).username ≠ users(uid2).username
+
+
+/*
+ * Chats Collection
+ * 
+ * The complete set of all chats in the system.
+ */
+schema Chats
+  chats: ChatID ⇸ Chat
+where
+  /* All chat IDs in the mapping correspond to the chat's id field */
+  ∀ cid: ChatID • cid ∈ dom chats ⇒ chats(cid).id = cid
+
+
+/*
+ * Messages Collection
+ * 
+ * The complete set of all messages in the system.
+ */
+schema Messages
+  messages: MessageID ⇸ Message
+where
+  /* All message IDs in the mapping correspond to the message's id field */
+  ∀ mid: MessageID • mid ∈ dom messages ⇒ messages(mid).id = mid
+  ∧
+  /* Messages are ordered by creation time within each chat */
+  /* This is enforced by database queries with ORDER BY created_at */
+  true
+
+
+/*
+ * ChatParticipants Collection
+ * 
+ * The complete set of all chat participation relationships.
+ */
+schema ChatParticipants
+  participants: ℙ(ChatParticipant)
+where
+  /* Each (chat_id, user_id) pair is unique */
+  ∀ p1, p2: ChatParticipant • 
+    p1 ∈ participants ∧ p2 ∈ participants ∧ 
+    p1.chat_id = p2.chat_id ∧ p1.user_id = p2.user_id ⇒ 
+    p1 = p2
+
+
+/*******************************************************************************
+ * SECTION 4: REFERENTIAL INTEGRITY CONSTRAINTS
+ ******************************************************************************/
+
+/*
+ * Database Referential Integrity
+ * 
+ * This schema defines the referential integrity constraints that ensure
+ * data consistency across related entities. These constraints are enforced
+ * by PostgreSQL foreign key constraints with CASCADE deletion.
+ */
+schema DatabaseIntegrity
+  Users
+  Chats
+  Messages
+  ChatParticipants
+where
+  /* Message Foreign Keys: All messages must reference valid chats and users */
+  ∀ mid: MessageID • mid ∈ dom messages ⇒
+    (messages(mid).chat_id ∈ dom chats ∧
+     messages(mid).sender_user_id ∈ dom users)
+  ∧
+  /* ChatParticipant Foreign Keys: All participants must reference valid chats and users */
+  ∀ p: ChatParticipant • p ∈ participants ⇒
+    (p.chat_id ∈ dom chats ∧ p.user_id ∈ dom users)
+  ∧
+  /* Chat Participation Constraint: Every chat must have at least 2 participants */
+  /* This is an application-level invariant, not enforced by database schema */
+  ∀ cid: ChatID • cid ∈ dom chats ⇒
+    #{p: ChatParticipant | p ∈ participants ∧ p.chat_id = cid} ≥ 2
+  ∧
+  /* Message Sender Participation: Message senders must be participants of the chat */
+  ∀ mid: MessageID • mid ∈ dom messages ⇒
+    ∃ p: ChatParticipant • 
+      p ∈ participants ∧ 
+      p.chat_id = messages(mid).chat_id ∧ 
+      p.user_id = messages(mid).sender_user_id
+
+
+/*******************************************************************************
+ * SECTION 5: DERIVED RELATIONSHIPS AND QUERIES
+ ******************************************************************************/
+
+/*
+ * Helper function: Get all participants of a chat
+ */
+chatParticipants: ChatID × ℙ(ChatParticipant) → ℙ(UserID)
+∀ cid: ChatID; ps: ℙ(ChatParticipant) •
+  chatParticipants(cid, ps) = 
+    {p.user_id | p: ChatParticipant • p ∈ ps ∧ p.chat_id = cid}
+
+
+/*
+ * Helper function: Get all chats for a user
+ */
+userChats: UserID × ℙ(ChatParticipant) → ℙ(ChatID)
+∀ uid: UserID; ps: ℙ(ChatParticipant) •
+  userChats(uid, ps) = 
+    {p.chat_id | p: ChatParticipant • p ∈ ps ∧ p.user_id = uid}
+
+
+/*
+ * Helper function: Get all messages in a chat
+ */
+chatMessages: ChatID × (MessageID ⇸ Message) → seq Message
+∀ cid: ChatID; msgs: MessageID ⇸ Message •
+  chatMessages(cid, msgs) = 
+    /* Returns messages ordered by created_at ascending */
+    /* Formal sequence ordering omitted for brevity, but enforced by implementation */
+    ⟨m: Message | ∃ mid: MessageID • mid ∈ dom msgs ∧ msgs(mid) = m ∧ m.chat_id = cid⟩
+
+
+/*
+ * Helper function: Get the last message in a chat
+ */
+lastMessage: ChatID × (MessageID ⇸ Message) → Message
+∀ cid: ChatID; msgs: MessageID ⇸ Message •
+  let chatMsgs == chatMessages(cid, msgs) •
+    #chatMsgs > 0 ⇒ lastMessage(cid, msgs) = last chatMsgs
+
+
+/*
+ * Helper function: Check if user is participant in chat
+ */
+isParticipant: UserID × ChatID × ℙ(ChatParticipant) → 𝔹
+∀ uid: UserID; cid: ChatID; ps: ℙ(ChatParticipant) •
+  isParticipant(uid, cid, ps) ⇔ 
+    ∃ p: ChatParticipant • p ∈ ps ∧ p.user_id = uid ∧ p.chat_id = cid
+
+
+/*
+ * Helper function: Get the other participant in a 2-person chat
+ */
+otherParticipant: UserID × ChatID × ℙ(ChatParticipant) × (UserID ⇸ User) → User
+∀ uid: UserID; cid: ChatID; ps: ℙ(ChatParticipant); us: UserID ⇸ User •
+  let participants == chatParticipants(cid, ps) •
+    uid ∈ participants ∧ #participants = 2 ⇒
+      ∃ other_uid: UserID • 
+        other_uid ∈ participants ∧ 
+        other_uid ≠ uid ∧
+        otherParticipant(uid, cid, ps, us) = us(other_uid)
+
+
+/*******************************************************************************
+ * SECTION 6: DATA VALIDATION PREDICATES
+ ******************************************************************************/
+
+/*
+ * Password Strength Validation
+ * 
+ * Validates password according to security requirements:
+ * - Minimum 8 characters
+ * - Additional constraints enforced by validators.ts
+ */
+validPassword: seq char → 𝔹
+∀ pwd: seq char •
+  validPassword(pwd) ⇔ #pwd ≥ MIN_PASSWORD_LENGTH
+
+
+/*
+ * Username Validation
+ * 
+ * Validates username according to requirements:
+ * - Between 3 and 18 characters
+ * - Alphanumeric with underscores allowed
+ */
+validUsername: seq char → 𝔹
+∀ uname: seq char •
+  validUsername(uname) ⇔ 
+    MIN_USERNAME_LENGTH ≤ #uname ∧ 
+    #uname ≤ MAX_USERNAME_LENGTH
+
+
+/*
+ * Message Content Validation
+ * 
+ * Validates message content:
+ * - Non-empty
+ * - Maximum 355 characters
+ */
+validMessageContent: seq char → 𝔹
+∀ content: seq char •
+  validMessageContent(content) ⇔ 
+    1 ≤ #content ∧ #content ≤ MAX_MESSAGE_LENGTH
+
+
+/*******************************************************************************
+ * SECTION 7: DATABASE STATE SCHEMA
+ ******************************************************************************/
+
+/*
+ * Complete Database State
+ * 
+ * This schema represents the entire state of the WhatsApp Clone database
+ * at any point in time, including all entities and relationships with
+ * referential integrity constraints.
+ */
+schema DatabaseState
+  DatabaseIntegrity
+where
+  /* All constraints from DatabaseIntegrity are inherited */
+  /* Additional system-wide invariants can be added here */
+  true
+
+
+/*******************************************************************************
+ * SECTION 8: SAMPLE DATA INVARIANTS
+ ******************************************************************************/
+
+/*
+ * Sample Database State
+ * 
+ * This schema defines the initial state with sample users and chats
+ * as specified in the resetDb() function in db.ts.
+ */
+schema SampleDatabaseState
+  DatabaseState
+where
+  /* Sample database has 5 users */
+  #(dom users) = 5
+  ∧
+  /* Sample database has 4 chats */
+  #(dom chats) = 4
+  ∧
+  /* Each sample chat has exactly 2 participants */
+  ∀ cid: ChatID • cid ∈ dom chats ⇒
+    #{p: ChatParticipant | p ∈ participants ∧ p.chat_id = cid} = 2
+  ∧
+  /* User with ID 1 ('ray') participates in all 4 chats */
+  ∃ uid: UserID • uid ∈ dom users ∧
+    #{p: ChatParticipant | p ∈ participants ∧ p.user_id = uid} = 4
+
+
+/*******************************************************************************
+ * SECTION 9: DATA LAYER OPERATIONS (Queries Only)
+ ******************************************************************************/
+
+/*
+ * Operation: Find User by Username
+ * 
+ * Corresponds to: UsersProvider.findByUsername(username)
+ */
+schema FindUserByUsername
+  ΞDatabaseState
+  username?: Username
+  user!: User
+where
+  ∃ uid: UserID • uid ∈ dom users ∧ 
+    users(uid).username = username? ∧
+    user! = users(uid)
+
+
+/*
+ * Operation: Find User by ID
+ * 
+ * Corresponds to: UsersProvider.findById(userId)
+ */
+schema FindUserById
+  ΞDatabaseState
+  userId?: UserID
+  user!: User
+where
+  userId? ∈ dom users ∧
+  user! = users(userId?)
+
+
+/*
+ * Operation: Find All Users Except Current
+ * 
+ * Corresponds to: UsersProvider.findAllExcept(userId)
+ */
+schema FindAllUsersExcept
+  ΞDatabaseState
+  currentUserId?: UserID
+  users!: seq User
+where
+  users! = ⟨users(uid) | uid: UserID • uid ∈ dom users ∧ uid ≠ currentUserId?⟩
+
+
+/*
+ * Operation: Find Chats by User
+ * 
+ * Corresponds to: ChatsProvider.findChatsByUser(userId)
+ */
+schema FindChatsByUser
+  ΞDatabaseState
+  userId?: UserID
+  chats!: seq Chat
+where
+  chats! = ⟨chats(cid) | cid: ChatID • cid ∈ userChats(userId?, participants)⟩
+
+
+/*
+ * Operation: Find Chat by ID and User
+ * 
+ * Corresponds to: ChatsProvider.findChatByUser({chatId, userId})
+ * Returns chat only if user is a participant
+ */
+schema FindChatByUser
+  ΞDatabaseState
+  chatId?: ChatID
+  userId?: UserID
+  chat!: Chat
+where
+  chatId? ∈ dom chats ∧
+  isParticipant(userId?, chatId?, participants) ∧
+  chat! = chats(chatId?)
+
+
+/*
+ * Operation: Find Messages by Chat with Pagination
+ * 
+ * Corresponds to: ChatsProvider.findMessagesByChat({chatId, limit, after})
+ */
+schema FindMessagesByChat
+  ΞDatabaseState
+  chatId?: ChatID
+  limit?: ℕ
+  after?: DateTime
+  messages!: seq Message
+  hasMore!: 𝔹
+  cursor!: DateTime
+where
+  chatId? ∈ dom chats ∧
+  limit? > 0 ∧
+  /* Messages filtered by chat and optionally by timestamp */
+  let allChatMessages == chatMessages(chatId?, messages) •
+    let filteredMessages == 
+      after? ≠ null ⇒ 
+        ⟨m: Message | m ∈ allChatMessages ∧ m.created_at < after?⟩
+      ⊕
+        allChatMessages •
+    /* Take limit messages in descending order */
+    #filteredMessages ≤ limit? ⇒
+      (messages! = filteredMessages ∧ hasMore! = false)
+    ⊕
+      (messages! = take(limit?, filteredMessages) ∧ hasMore! = true) ∧
+    /* Cursor is the created_at of the last message */
+    #messages! > 0 ⇒ cursor! = (last messages!).created_at
+
+
+/*
+ * Operation: Get Last Message in Chat
+ * 
+ * Corresponds to: ChatsProvider.lastMessage(chatId)
+ */
+schema GetLastMessage
+  ΞDatabaseState
+  chatId?: ChatID
+  message!: Message
+where
+  chatId? ∈ dom chats ∧
+  message! = lastMessage(chatId?, messages)
+
+
+/*
+ * Operation: Get Chat Participants
+ * 
+ * Corresponds to: ChatsProvider.participants(chatId)
+ */
+schema GetChatParticipants
+  ΞDatabaseState
+  chatId?: ChatID
+  participants!: seq User
+where
+  chatId? ∈ dom chats ∧
+  participants! = ⟨users(uid) | uid: UserID • uid ∈ chatParticipants(chatId?, participants)⟩
+
+
+/*
+ * Operation: Check if User is Participant
+ * 
+ * Corresponds to: ChatsProvider.isParticipant({chatId, userId})
+ */
+schema CheckIsParticipant
+  ΞDatabaseState
+  chatId?: ChatID
+  userId?: UserID
+  result!: 𝔹
+where
+  result! = isParticipant(userId?, chatId?, participants)
+
+
+/*******************************************************************************
+ * END OF DATA MODEL SPECIFICATION
+ ******************************************************************************/
+
+/*
+ * NOTES ON IMPLEMENTATION MAPPING:
+ * 
+ * 1. Database Connection Pool:
+ *    - Managed by pg.Pool in db.ts
+ *    - Connection pooling not modeled in formal spec
+ * 
+ * 2. DataLoader Caching:
+ *    - DataLoader provides request-scoped caching
+ *    - Not modeled in formal spec as it's a performance optimization
+ *    - Does not affect logical semantics
+ * 
+ * 3. SQL Template Strings:
+ *    - Used for parameterized queries to prevent SQL injection
+ *    - Security mechanism, not modeled in formal spec
+ * 
+ * 4. Auto-incrementing IDs:
+ *    - PostgreSQL SERIAL type generates unique IDs
+ *    - Modeled abstractly as distinct identifier types
+ * 
+ * 5. Timestamp Generation:
+ *    - Database generates timestamps with DEFAULT NOW()
+ *    - Modeled as DateTime type (Unix timestamp)
+ * 
+ * 6. Cascade Deletion:
+ *    - ON DELETE CASCADE ensures referential integrity
+ *    - Will be modeled in operations.zpp for delete operations
+ */

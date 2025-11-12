@@ -1,0 +1,691 @@
+/*******************************************************************************
+ * WhatsApp Clone - System State Formal Specification (Z++)
+ * 
+ * This specification formalizes the overall system state of the WhatsApp Clone
+ * backend, including runtime state, session management, authentication context,
+ * and caching layers.
+ * 
+ * Builds upon data_model.zpp to define the complete runtime system state.
+ ******************************************************************************/
+
+include "data_model.zpp"
+
+
+/*******************************************************************************
+ * SECTION 1: SESSION AND AUTHENTICATION STATE
+ ******************************************************************************/
+
+/*
+ * JSON Web Token (JWT)
+ * 
+ * Represents an encoded authentication token containing the username.
+ * Format: Base64-encoded JSON signed with HMAC-SHA256.
+ */
+AuthToken == seq char
+
+/*
+ * JWT Secret Key
+ * 
+ * Secret key used to sign and verify JWT tokens.
+ * Loaded from environment variable or defaults to 'secret-value'.
+ */
+JWTSecret == seq char
+
+/*
+ * Token Expiration
+ * 
+ * Time-to-live for JWT tokens in milliseconds.
+ * Default: 365 days
+ */
+TokenExpiration == ℕ
+
+given
+  DEFAULT_EXPIRATION == 365 * 24 * 60 * 60 * 1000  // milliseconds
+
+
+/*
+ * Authentication Cookie
+ * 
+ * HTTP cookie containing the authentication token.
+ * Set as HTTP-only for security.
+ */
+schema AuthCookie
+  name: seq char
+  value: AuthToken
+  maxAge: TokenExpiration
+  httpOnly: 𝔹
+where
+  name = "authToken" ∧
+  httpOnly = true ∧
+  maxAge > 0
+
+
+/*
+ * HTTP Request Context
+ * 
+ * Represents the HTTP request context containing cookies and headers.
+ */
+schema HTTPRequest
+  cookies: seq char ⇸ seq char
+  headers: seq char ⇸ seq char
+  method: seq char
+  path: seq char
+where
+  method ∈ {"GET", "POST", "PUT", "DELETE", "OPTIONS"}
+
+
+/*
+ * HTTP Response Context
+ * 
+ * Represents the HTTP response context for setting cookies and headers.
+ */
+schema HTTPResponse
+  cookies: seq AuthCookie
+  headers: seq char ⇸ seq char
+  statusCode: ℕ
+where
+  statusCode ≥ 100 ∧ statusCode < 600
+
+
+/*
+ * Session State
+ * 
+ * Represents a single user session tied to a GraphQL request.
+ * Session-scoped providers (Auth, Chats) are instantiated per session.
+ * 
+ * Maps to: ModuleSessionInfo in @graphql-modules/core
+ */
+schema SessionState
+  sessionId: seq char
+  request: HTTPRequest
+  response: HTTPResponse
+  currentUser: UserID ∪ {null}
+  startTime: DateTime
+where
+  /* Session must have unique ID */
+  #sessionId > 0
+
+
+/*
+ * Active Sessions
+ * 
+ * Collection of all active sessions in the system.
+ */
+schema ActiveSessions
+  sessions: seq char ⇸ SessionState
+where
+  /* Each session ID maps to its session state */
+  ∀ sid: seq char • sid ∈ dom sessions ⇒ sessions(sid).sessionId = sid
+
+
+/*******************************************************************************
+ * SECTION 2: AUTHENTICATION STATE
+ ******************************************************************************/
+
+/*
+ * JWT Claims
+ * 
+ * Data encoded in a JWT token.
+ * For this system, JWT contains only the username.
+ */
+schema JWTClaims
+  username: Username
+  issuedAt: DateTime
+  expiresAt: DateTime
+where
+  issuedAt < expiresAt
+
+
+/*
+ * Authentication Configuration
+ * 
+ * System-wide authentication configuration.
+ * Maps to: env.ts (secret, expiration)
+ */
+schema AuthConfig
+  jwtSecret: JWTSecret
+  tokenExpiration: TokenExpiration
+where
+  #jwtSecret > 0 ∧
+  tokenExpiration > 0
+
+
+/*
+ * Authentication Context
+ * 
+ * Runtime authentication state for the current session.
+ * 
+ * Maps to: Auth provider in modules/users/auth.provider.ts
+ */
+schema AuthContext
+  SessionState
+  Users
+  authConfig: AuthConfig
+  authenticated: 𝔹
+where
+  /* If authenticated, currentUser must be valid */
+  authenticated = true ⇒ currentUser ∈ dom users ∧ currentUser ≠ null
+  ∧
+  /* If not authenticated, currentUser must be null */
+  authenticated = false ⇒ currentUser = null
+
+
+/*
+ * Helper function: Verify JWT Token
+ * 
+ * Verifies a JWT token and extracts the username.
+ * Returns null if token is invalid or expired.
+ */
+verifyJWT: AuthToken × JWTSecret × DateTime → (Username ∪ {null})
+∀ token: AuthToken; secret: JWTSecret; currentTime: DateTime •
+  /* Abstract specification - actual implementation uses jsonwebtoken library */
+  true
+
+
+/*
+ * Helper function: Sign JWT Token
+ * 
+ * Creates a JWT token for a username.
+ */
+signJWT: Username × JWTSecret → AuthToken
+∀ username: Username; secret: JWTSecret •
+  /* Abstract specification - actual implementation uses jsonwebtoken library */
+  true
+
+
+/*******************************************************************************
+ * SECTION 3: CACHING STATE
+ ******************************************************************************/
+
+/*
+ * DataLoader Cache Entry
+ * 
+ * Represents a cached value in DataLoader with timestamp.
+ */
+[CacheKey]  // Abstract cache key type
+
+schema CacheEntry[T]
+  key: CacheKey
+  value: T
+  timestamp: DateTime
+where
+  timestamp > 0
+
+
+/*
+ * DataLoader State
+ * 
+ * Request-scoped cache for batching and caching database queries.
+ * 
+ * Maps to: DataLoader instances in ChatsProvider
+ */
+schema DataLoaderState
+  chatCache: CacheKey ⇸ Chat
+  messageCache: CacheKey ⇸ Message
+  userCache: CacheKey ⇸ User
+  batchQueue: seq (CacheKey × DateTime)
+where
+  /* Cache is cleared at end of request */
+  /* Batch queue processes pending loads */
+  true
+
+
+/*******************************************************************************
+ * SECTION 4: PUBSUB STATE (Real-time Subscriptions)
+ ******************************************************************************/
+
+/*
+ * PubSub Event Types
+ */
+EventType ::= messageAdded | chatAdded | chatRemoved
+
+/*
+ * PubSub Event
+ * 
+ * Represents an event published to subscribers.
+ */
+schema PubSubEvent
+  eventType: EventType
+  payload: MessageID ∪ ChatID  // Depends on event type
+  timestamp: DateTime
+where
+  timestamp > 0
+
+
+/*
+ * Subscription Filter
+ * 
+ * Function to determine if a subscriber should receive an event.
+ * Used in withFilter for GraphQL subscriptions.
+ */
+SubscriptionFilter == PubSubEvent × SessionState → 𝔹
+
+
+/*
+ * Active Subscription
+ * 
+ * Represents an active GraphQL subscription from a client.
+ */
+schema ActiveSubscription
+  subscriptionId: seq char
+  sessionId: seq char
+  eventType: EventType
+  filter: SubscriptionFilter
+  createdAt: DateTime
+where
+  #subscriptionId > 0 ∧
+  #sessionId > 0
+
+
+/*
+ * PubSub State
+ * 
+ * Manages real-time event publishing and subscription.
+ * 
+ * Maps to: PubSub provider using graphql-postgres-subscriptions
+ */
+schema PubSubState
+  subscriptions: seq char ⇸ ActiveSubscription
+  eventQueue: seq PubSubEvent
+  postgresChannel: seq char ⇸ EventType
+where
+  /* Each subscription ID maps to an active subscription */
+  ∀ sid: seq char • sid ∈ dom subscriptions ⇒ 
+    subscriptions(sid).subscriptionId = sid
+  ∧
+  /* PostgreSQL LISTEN channels map to event types */
+  ∀ channel: seq char • channel ∈ dom postgresChannel ⇒
+    channel ∈ {"messageAdded", "chatAdded", "chatRemoved"}
+
+
+/*******************************************************************************
+ * SECTION 5: DATABASE CONNECTION POOL STATE
+ ******************************************************************************/
+
+/*
+ * Database Connection
+ * 
+ * Represents a single connection to PostgreSQL.
+ */
+schema DBConnection
+  connectionId: seq char
+  inUse: 𝔹
+  createdAt: DateTime
+  lastUsed: DateTime
+where
+  #connectionId > 0 ∧
+  lastUsed ≥ createdAt
+
+
+/*
+ * Connection Pool State
+ * 
+ * Manages a pool of database connections.
+ * 
+ * Maps to: pg.Pool in db.ts
+ */
+schema ConnectionPoolState
+  connections: seq char ⇸ DBConnection
+  maxConnections: ℕ
+  idleTimeout: ℕ
+  connectionString: seq char
+where
+  /* Number of connections does not exceed max */
+  #(dom connections) ≤ maxConnections ∧
+  maxConnections > 0 ∧
+  idleTimeout > 0
+
+
+/*******************************************************************************
+ * SECTION 6: EXTERNAL API STATE
+ ******************************************************************************/
+
+/*
+ * Unsplash API Configuration
+ * 
+ * Configuration for Unsplash API integration.
+ */
+schema UnsplashConfig
+  accessKey: seq char
+  baseURL: URL
+where
+  #accessKey > 0 ∧
+  baseURL = "https://api.unsplash.com"
+
+
+/*
+ * REST Data Source Cache
+ * 
+ * Apollo REST Data Source provides HTTP caching.
+ * Maps to: UnsplashApi extends RESTDataSource
+ */
+schema RESTDataSourceCache
+  urlCache: URL ⇸ (seq char × DateTime)  // (response, timestamp) pairs
+  cacheTTL: ℕ
+where
+  cacheTTL > 0
+
+
+/*
+ * External API State
+ * 
+ * State for external API integrations.
+ */
+schema ExternalAPIState
+  unsplashConfig: UnsplashConfig
+  unsplashCache: RESTDataSourceCache
+
+
+/*******************************************************************************
+ * SECTION 7: COMPLETE SYSTEM STATE
+ ******************************************************************************/
+
+/*
+ * Runtime Configuration
+ * 
+ * System-wide runtime configuration loaded from environment.
+ * Maps to: env.ts
+ */
+schema RuntimeConfig
+  authConfig: AuthConfig
+  databaseConfig: ConnectionPoolState
+  serverPort: ℕ
+  serverOrigin: URL
+  resetDbOnStartup: 𝔹
+  fakedDbRecords: ℕ
+where
+  serverPort > 0 ∧ serverPort < 65536
+
+
+/*
+ * Complete Application State
+ * 
+ * This schema represents the complete runtime state of the WhatsApp Clone
+ * backend server at any point in time.
+ */
+schema ApplicationState
+  /* Persistent Data Layer */
+  DatabaseState
+  
+  /* Runtime State */
+  activeSessions: ActiveSessions
+  authContext: AuthConfig
+  pubsubState: PubSubState
+  connectionPool: ConnectionPoolState
+  externalAPIs: ExternalAPIState
+  config: RuntimeConfig
+  
+  /* Server Lifecycle */
+  serverStartTime: DateTime
+  serverRunning: 𝔹
+where
+  /* Server must have started if it's running */
+  serverRunning = true ⇒ serverStartTime > 0
+  ∧
+  /* All active sessions reference valid users or are unauthenticated */
+  ∀ sid: seq char • sid ∈ dom activeSessions.sessions ⇒
+    let session == activeSessions.sessions(sid) •
+      session.currentUser ≠ null ⇒ session.currentUser ∈ dom users
+  ∧
+  /* All active subscriptions reference active sessions */
+  ∀ subId: seq char • subId ∈ dom pubsubState.subscriptions ⇒
+    pubsubState.subscriptions(subId).sessionId ∈ dom activeSessions.sessions
+
+
+/*******************************************************************************
+ * SECTION 8: SESSION LIFECYCLE SCHEMAS
+ ******************************************************************************/
+
+/*
+ * Initial System State
+ * 
+ * System state when server starts.
+ */
+schema InitialApplicationState
+  ApplicationState
+where
+  /* No active sessions initially */
+  dom activeSessions.sessions = ∅
+  ∧
+  /* No active subscriptions initially */
+  dom pubsubState.subscriptions = ∅
+  ∧
+  /* Server is running */
+  serverRunning = true
+  ∧
+  /* Database is initialized (possibly with sample data) */
+  config.resetDbOnStartup = true ⇒ 
+    /* Sample database state conditions */
+    #(dom users) ≥ 5 ∧ #(dom chats) ≥ 4
+
+
+/*
+ * Operation: Create Session
+ * 
+ * Creates a new session when a GraphQL request arrives.
+ */
+schema CreateSession
+  ΔApplicationState
+  request?: HTTPRequest
+  response?: HTTPResponse
+  newSessionId!: seq char
+where
+  /* Generate unique session ID */
+  newSessionId! ∉ dom activeSessions.sessions
+  ∧
+  /* Create new session state */
+  let newSession == SessionState' | 
+    newSession.sessionId = newSessionId! ∧
+    newSession.request = request? ∧
+    newSession.response = response? ∧
+    newSession.currentUser = null ∧
+    newSession.startTime = /* current time */ •
+    activeSessions'.sessions = 
+      activeSessions.sessions ⊕ {newSessionId! ↦ newSession}
+  ∧
+  /* Rest of state unchanged */
+  DatabaseState' = DatabaseState ∧
+  pubsubState' = pubsubState ∧
+  connectionPool' = connectionPool
+
+
+/*
+ * Operation: Destroy Session
+ * 
+ * Cleans up session when request completes.
+ */
+schema DestroySession
+  ΔApplicationState
+  sessionId?: seq char
+where
+  sessionId? ∈ dom activeSessions.sessions
+  ∧
+  /* Remove session from active sessions */
+  activeSessions'.sessions = activeSessions.sessions ⊖ {sessionId?}
+  ∧
+  /* Remove associated subscriptions */
+  pubsubState'.subscriptions = 
+    {sid ↦ sub | sid: seq char; sub: ActiveSubscription •
+      sid ∈ dom pubsubState.subscriptions ∧
+      sub = pubsubState.subscriptions(sid) ∧
+      sub.sessionId ≠ sessionId?}
+  ∧
+  /* Rest of state unchanged */
+  DatabaseState' = DatabaseState ∧
+  connectionPool' = connectionPool
+
+
+/*******************************************************************************
+ * SECTION 9: SUBSCRIPTION LIFECYCLE SCHEMAS
+ ******************************************************************************/
+
+/*
+ * Operation: Create Subscription
+ * 
+ * Creates a new GraphQL subscription.
+ */
+schema CreateSubscription
+  ΔApplicationState
+  sessionId?: seq char
+  eventType?: EventType
+  filter?: SubscriptionFilter
+  subscriptionId!: seq char
+where
+  /* Session must exist */
+  sessionId? ∈ dom activeSessions.sessions
+  ∧
+  /* Generate unique subscription ID */
+  subscriptionId! ∉ dom pubsubState.subscriptions
+  ∧
+  /* Create new subscription */
+  let newSub == ActiveSubscription' |
+    newSub.subscriptionId = subscriptionId! ∧
+    newSub.sessionId = sessionId? ∧
+    newSub.eventType = eventType? ∧
+    newSub.filter = filter? ∧
+    newSub.createdAt = /* current time */ •
+    pubsubState'.subscriptions = 
+      pubsubState.subscriptions ⊕ {subscriptionId! ↦ newSub}
+  ∧
+  /* Rest of state unchanged */
+  DatabaseState' = DatabaseState ∧
+  activeSessions' = activeSessions
+
+
+/*
+ * Operation: Publish Event
+ * 
+ * Publishes an event to all matching subscribers.
+ */
+schema PublishEvent
+  ΔApplicationState
+  event?: PubSubEvent
+  notifiedSessions!: ℙ(seq char)
+where
+  /* Add event to queue */
+  pubsubState'.eventQueue = pubsubState.eventQueue ⌢ ⟨event?⟩
+  ∧
+  /* Determine which subscriptions should receive the event */
+  notifiedSessions! = 
+    {sub.sessionId | sub: ActiveSubscription •
+      sub ∈ ran pubsubState.subscriptions ∧
+      sub.eventType = event?.eventType ∧
+      sub.filter(event?, activeSessions.sessions(sub.sessionId))}
+  ∧
+  /* Send event to PostgreSQL NOTIFY */
+  /* Implementation detail: PostgreSQL NOTIFY event?.eventType */
+  true
+  ∧
+  /* Rest of state unchanged */
+  DatabaseState' = DatabaseState ∧
+  activeSessions' = activeSessions
+
+
+/*******************************************************************************
+ * SECTION 10: SYSTEM INVARIANTS
+ ******************************************************************************/
+
+/*
+ * Global System Invariants
+ * 
+ * Properties that must hold for all valid system states.
+ */
+schema SystemInvariants
+  ApplicationState
+where
+  /* Authenticated sessions reference valid users */
+  ∀ sid: seq char • sid ∈ dom activeSessions.sessions ⇒
+    let session == activeSessions.sessions(sid) •
+      session.currentUser ≠ null ⇒ session.currentUser ∈ dom users
+  ∧
+  /* Subscriptions only exist for active sessions */
+  ∀ subId: seq char • subId ∈ dom pubsubState.subscriptions ⇒
+    pubsubState.subscriptions(subId).sessionId ∈ dom activeSessions.sessions
+  ∧
+  /* Connection pool does not exceed maximum */
+  #(dom connectionPool.connections) ≤ connectionPool.maxConnections
+  ∧
+  /* All database integrity constraints are maintained */
+  /* (inherited from DatabaseIntegrity in data_model.zpp) */
+  true
+
+
+/*******************************************************************************
+ * SECTION 11: HEALTH AND MONITORING STATE
+ ******************************************************************************/
+
+/*
+ * System Health Metrics
+ * 
+ * Runtime metrics for monitoring system health.
+ */
+schema SystemMetrics
+  activeSessionCount: ℕ
+  activeSubscriptionCount: ℕ
+  activeConnectionCount: ℕ
+  totalUsers: ℕ
+  totalChats: ℕ
+  totalMessages: ℕ
+  uptime: ℕ
+where
+  activeSessionCount ≥ 0 ∧
+  activeSubscriptionCount ≥ 0 ∧
+  activeConnectionCount ≥ 0 ∧
+  totalUsers ≥ 0 ∧
+  totalChats ≥ 0 ∧
+  totalMessages ≥ 0 ∧
+  uptime ≥ 0
+
+
+/*
+ * Operation: Get System Metrics
+ * 
+ * Retrieves current system metrics.
+ */
+schema GetSystemMetrics
+  ΞApplicationState
+  metrics!: SystemMetrics
+where
+  metrics!.activeSessionCount = #(dom activeSessions.sessions) ∧
+  metrics!.activeSubscriptionCount = #(dom pubsubState.subscriptions) ∧
+  metrics!.activeConnectionCount = 
+    #{cid: seq char | cid ∈ dom connectionPool.connections ∧ 
+      connectionPool.connections(cid).inUse = true} ∧
+  metrics!.totalUsers = #(dom users) ∧
+  metrics!.totalChats = #(dom chats) ∧
+  metrics!.totalMessages = #(dom messages) ∧
+  metrics!.uptime = /* current time */ - serverStartTime
+
+
+/*******************************************************************************
+ * END OF SYSTEM STATE SPECIFICATION
+ ******************************************************************************/
+
+/*
+ * NOTES ON IMPLEMENTATION:
+ * 
+ * 1. Session Management:
+ *    - Sessions created per GraphQL request via GraphQL Modules
+ *    - Session-scoped providers instantiated per request
+ *    - Session cleaned up after request completes
+ * 
+ * 2. DataLoader Caching:
+ *    - Request-scoped cache, cleared after request
+ *    - Batches database queries within single event loop tick
+ *    - Prevents N+1 query problem
+ * 
+ * 3. PubSub Implementation:
+ *    - Uses PostgreSQL LISTEN/NOTIFY for scalability
+ *    - Events filtered per subscriber using withFilter
+ *    - Subscription lifecycle tied to WebSocket connection
+ * 
+ * 4. Connection Pooling:
+ *    - pg.Pool manages connections
+ *    - Connections reused across requests
+ *    - Idle connections closed after timeout
+ * 
+ * 5. Authentication Token:
+ *    - JWT stored in HTTP-only cookie
+ *    - Token verified on each request
+ *    - currentUser cached in session provider
+ */
